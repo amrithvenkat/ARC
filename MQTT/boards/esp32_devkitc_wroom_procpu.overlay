@@ -1,0 +1,29 @@
+/{
+    aliases {
+        led0=&myled;
+        sw1=&button1;
+
+    };
+
+    leds {
+		compatible = "gpio-leds";
+        status="okay";
+
+		myled: led_0 {
+			gpios =  <&gpio0 4 GPIO_ACTIVE_HIGH>;
+			label = "Blue - LED0";
+		};
+    };
+    buttons{
+        button1: button_1{
+            gpios = <&gpio0 1 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "LED control Button";
+			zephyr,code = <INPUT_KEY_1>;
+        };
+    };
+
+};
+
+&wifi {
+    status="okay";
+};
