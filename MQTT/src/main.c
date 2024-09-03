@@ -368,4 +368,5 @@ int main(void)
 
         mqtt_live(&client);
     }
+    return 0;
 }
