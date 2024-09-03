@@ -1,3 +1,7 @@
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(main, LOG_LEVEL_ERR);
+
 #include <stdio.h>
 #include <inttypes.h>
 
@@ -6,15 +10,19 @@
 #include <zephyr/drivers/gpio.h>
 
 #include <zephyr/net/mqtt.h>
+#include <zephyr/net/wifi.h>
 #include <zephyr/net/socket.h>
-
-#include <zephyr/logging/log.h>
-
-LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_core.h>
+#include <zephyr/net/net_context.h>
+#include <zephyr/net/net_mgmt.h>
 
 #define SLEEP_TIME_MS 100
 
-/* MQTT broker details */
+#define WIFI_SSID "your_wifi_ssid"  // Replace with your Wi-Fi SSID
+#define WIFI_PASS "your_wifi_password"  // Replace with your Wi-Fi Password
+
+// MQTT broker details 
 #define MQTT_BROKER_ADDR "192.168.1.10" // Replace with your MQTT broker IP
 #define MQTT_BROKER_PORT 1883
 
@@ -25,7 +33,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 struct mqtt_client client;
 struct sockaddr_in broker;
 
-/* The devicetree node identifier for the "led0" alias. */
+// The devicetree node identifier for the "led0" alias.
 #define LED0_NODE DT_ALIAS(led0)
 
 #if DT_NODE_HAS_STATUS(LED0_NODE, okay)
@@ -39,7 +47,7 @@ struct sockaddr_in broker;
 #define FLAGS 0
 #endif
 
-/* The devicetree node identifier for the "sw1" alias. */
+//  The devicetree node identifier for the "sw1" alias.
 #define SW1_NODE DT_ALIAS(sw1)
 
 #if !DT_NODE_HAS_STATUS(SW1_NODE, okay)
@@ -49,7 +57,10 @@ struct sockaddr_in broker;
 static struct gpio_dt_spec led = GPIO_DT_SPEC_GET_OR(LED0_NODE, gpios, {0});
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW1_NODE, gpios, {0});
 static struct gpio_callback button_cb_data;
+static struct net_mgmt_event_callback dhcp_cb;
 static struct zsock_pollfd fds[1];
+
+K_SEM_DEFINE(netif_ready, 0, 1);
 
 // Function protoypes
 void mqtt_event_handler(struct mqtt_client *const c, const struct mqtt_evt *evt);
@@ -59,6 +70,7 @@ void configure_led();
 void configure_button();
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins);
 void mqtt_subscribe_topics();
+void wifi_interface_init_function();
 
 // Button functions
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -137,8 +149,8 @@ void turn_off_led()
 
 // MQTT functions
 
-/* MQTT Event Handler */
-void mqtt_event_handler(struct mqtt_client *const c, const struct mqtt_evt *evt)
+// MQTT Event Handler
+void mqtt_event_handler(struct mqtt_client *const client, const struct mqtt_evt *evt)
 {
     switch (evt->type)
     {
@@ -168,13 +180,55 @@ void mqtt_event_handler(struct mqtt_client *const c, const struct mqtt_evt *evt)
     case MQTT_EVT_DISCONNECT:
         LOG_ERR("MQTT disconnected!");
         break;
+    
+    case MQTT_EVT_PUBACK:
+		if (evt->result != 0) {
+			LOG_ERR("MQTT PUBACK error %d", evt->result);
+			break;
+		}
+		LOG_INF("PUBACK packet id: %u", evt->param.puback.message_id);
+		break;
+
+    case MQTT_EVT_PUBREC:
+		if (evt->result != 0) {
+			LOG_ERR("MQTT PUBREC error %d", evt->result);
+			break;
+		}
+
+		LOG_INF("PUBREC packet id: %u", evt->param.pubrec.message_id);
+
+		const struct mqtt_pubrel_param rel_param = {
+			.message_id = evt->param.pubrec.message_id
+		};
+
+		int err = mqtt_publish_qos2_release(client, &rel_param);
+		if (err != 0) {
+			LOG_ERR("Failed to send MQTT PUBREL: %d", err);
+		}
+
+		break;
+
+	case MQTT_EVT_PUBCOMP:
+		if (evt->result != 0) {
+			LOG_ERR("MQTT PUBCOMP error %d", evt->result);
+			break;
+		}
+
+		LOG_INF("PUBCOMP packet id: %u",
+			evt->param.pubcomp.message_id);
+
+		break;
+
+	case MQTT_EVT_PINGRESP:
+		LOG_INF("PINGRESP packet");
+		break;
 
     default:
         break;
     }
 }
 
-/* Publish Button Event */
+// Publish Button Event
 void mqtt_publish_button_event()
 {
     struct mqtt_publish_param param;
@@ -197,7 +251,7 @@ void mqtt_publish_button_event()
     }
 }
 
-/* Subscribe to MQTT topics */
+// Subscribe to MQTT topics
 void mqtt_subscribe_topics()
 {
     struct mqtt_topic led_topic = {
@@ -235,7 +289,7 @@ void mqtt_connect_function()
     client.client_id.size = strlen(MQTT_CLIENT_ID);
     client.protocol_version = MQTT_VERSION_3_1_1;
 
-    /* Configure broker */
+    //  Configure broker
     broker.sin_family = AF_INET;
     broker.sin_port = htons(MQTT_BROKER_PORT);
     if (net_addr_pton(AF_INET, MQTT_BROKER_ADDR, &broker.sin_addr) < 0)
@@ -257,11 +311,45 @@ void mqtt_connect_function()
     fds[0].events = ZSOCK_POLLIN;
 }
 
+
+
+// Wifi functions
+
+void handler_cb(struct net_mgmt_event_callback *cb,
+		    uint32_t mgmt_event, struct net_if *iface)
+{
+	if (mgmt_event != NET_EVENT_IPV4_DHCP_BOUND) {
+		return;
+	}
+	k_sem_give(&netif_ready);
+}
+
+void wifi_interface_init_function(void)
+{
+	struct net_if *iface;
+
+	net_mgmt_init_event_callback(&dhcp_cb, handler_cb,
+				     NET_EVENT_IPV4_DHCP_BOUND);
+
+	net_mgmt_add_event_callback(&dhcp_cb);
+
+	iface = net_if_get_default();
+	if (!iface) {
+		LOG_ERR("wifi interface not available");
+		return;
+	}
+
+	net_dhcpv4_start(iface);
+	k_sem_take(&netif_ready, K_FOREVER);
+}
+
+
 int main(void)
 {
     configure_led();
     configure_button();
 
+    wifi_interface_init_function();
     mqtt_connect_function();
 
     while (1)
