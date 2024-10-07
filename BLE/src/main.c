@@ -26,18 +26,18 @@
 #define FLAGS 0
 #endif
 
-// The devicetree node identifier for the "sw1" alias.
-#define SW1_NODE DT_ALIAS(sw1)
+// The devicetree node identifier for the "sw0" alias.
+#define SW0_NODE DT_ALIAS(sw0)
 
-#if !DT_NODE_HAS_STATUS(SW1_NODE, okay)
+#if !DT_NODE_HAS_STATUS(SW0_NODE, okay)
 #error "Unsupported board: sw1 devicetree alias is not defined"
 #endif
 
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW1_NODE, gpios, {0});
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios, {0});
 static struct gpio_callback button_cb_data;
 
 static struct gpio_dt_spec led = GPIO_DT_SPEC_GET_OR(LED0_NODE, gpios, {0});
-static uint8_t led_state = false;
+static uint8_t led_state = true;
 
 // Service and Characteristics UUIDs
 static struct bt_uuid_128 led_state_char_uuid = BT_UUID_INIT_128(
@@ -89,7 +89,7 @@ static ssize_t read_led_state(struct bt_conn *conn,
 							  uint16_t len, uint16_t offset)
 {
 	const uint8_t *value = attr->user_data;
-	printk("Value 0x%x read.\n", *value);
+	printk("Value 0x%02x read.\n", *value);
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, value, sizeof(*value));
 }
 
@@ -99,8 +99,7 @@ static ssize_t write_led_state(struct bt_conn *conn,
 {
 	uint8_t *value = attr->user_data;
 	*value = *((uint8_t *)buf);
-	printk("Value 0x%x written.\n", *value);
-
+	printk("Value 0x%02x written.\n", *value);
 	printk("Current LED state %s - turning LED %s\n", led_state ? "off" : "on",
 		   led_state ? "on" : "off");
 	gpio_pin_set_dt(&led, led_state);
@@ -119,6 +118,11 @@ BT_GATT_SERVICE_DEFINE(
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	printk("Button pressed at %" PRIu32 "\n", k_cycle_get_32());
+	gpio_pin_toggle_dt(&led);
+	led_state = !led_state;
+	bt_gatt_notify(NULL, &led_svc.attrs[1], &led_state, sizeof(led_state));
+	printk("Toggle using button. Current LED state %s - turning LED %s\n", led_state ? "off" : "on",
+		   led_state ? "on" : "off");
 }
 
 void configure_button()
@@ -157,7 +161,8 @@ void configure_button()
 void configure_led()
 {
 	int ret;
-	if (led.port && !gpio_is_ready_dt(&led))
+	ret = gpio_is_ready_dt(&led);
+	if (led.port && !ret)
 	{
 		printk("Error %d: LED device %s is not ready; ignoring it\n",
 			   ret, led.port->name);
@@ -177,16 +182,6 @@ void configure_led()
 			printk("Set up LED at %s pin %d\n", led.port->name, led.pin);
 		}
 	}
-}
-
-void turn_on_led()
-{
-	gpio_pin_set_dt(&led, 1);
-}
-
-void turn_off_led()
-{
-	gpio_pin_set_dt(&led, 0);
 }
 
 int main(void)
@@ -217,13 +212,6 @@ int main(void)
 	{
 		while (1)
 		{
-			/* If we have an LED, match its state to the button's. */
-			int val = gpio_pin_get_dt(&button);
-
-			if (val >= 0)
-			{
-				gpio_pin_set_dt(&led, val);
-			}
 			k_msleep(SLEEP_TIME_MS);
 		}
 	}
